@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "interview-copilot"
+version = "0.1.0"
+description = "Local-first Windows bilingual real-time interview assistant powered by Qwen"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "PySide6-Essentials",
+    "qasync",
+    "PyAudioWPatch",
+    "websockets",
+    "openai",
+    "httpx",
+    "numpy",
+    "pypdf",
+    "python-docx",
+    "keyring",
+    "platformdirs",
+    "truststore",
+    "certifi",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio", "ruff", "pyinstaller"]
+
+[project.scripts]
+interview-copilot = "interview_copilot.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

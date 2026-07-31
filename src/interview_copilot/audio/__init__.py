@@ -1,0 +1,1 @@
+"""Windows audio capture."""
