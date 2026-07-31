@@ -134,12 +134,17 @@ class QwenRealtimeSpeech:
                         self._ws = ws
                         self._active_url = url
                         await ws.send(json.dumps(self._session_config(), ensure_ascii=False))
+                        await self._wait_session_ready(ws)
                         await self._emit(
                             SpeechEventType.STATUS,
                             f"实时识别已连接（{url.split('://', 1)[-1].split('/')[0]}）",
                         )
                         connected = True
                         backoff = 1.0
+                        # Drop stale chunks captured before the session was ready.
+                        while not self._audio.empty():
+                            with suppress(asyncio.QueueEmpty):
+                                self._audio.get_nowait()
                         sender = asyncio.create_task(self._send_audio(ws))
                         receiver = asyncio.create_task(self._receive(ws))
                         done, pending = await asyncio.wait(
@@ -174,14 +179,43 @@ class QwenRealtimeSpeech:
             "type": "session.update",
             "session": {
                 "modalities": ["text"],
+                "sample_rate": 16000,
                 "input_audio_format": "pcm",
                 "input_audio_transcription": {
                     "model": self.settings.asr_model,
                     "language": self.settings.source_language,
                 },
                 "translation": {"language": self.settings.target_language},
+                # Slightly more sensitive than default 0.2 so quiet laptop playback
+                # through WASAPI loopback is still detected.
+                "turn_detection": {
+                    "type": "server_vad",
+                    "threshold": 0.05,
+                    "silence_duration_ms": 800,
+                },
             },
         }
+
+    async def _wait_session_ready(self, ws) -> None:
+        """Wait until session.update is acknowledged before streaming audio."""
+        deadline = asyncio.get_running_loop().time() + 10
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise TimeoutError("等待 session.updated 超时")
+            raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+            event = json.loads(raw)
+            kind = event.get("type", "")
+            if kind == "session.updated":
+                logger.info("Realtime session ready: %s", kind)
+                return
+            if kind == "error":
+                error = event.get("error", {})
+                raise RuntimeError(
+                    str(error.get("message") or event.get("message") or "session.update 失败")
+                )
+            # session.created and other preamble events may arrive before update ack.
+            logger.debug("Ignoring pre-ready realtime event: %s", kind)
 
     async def _send_audio(self, ws) -> None:
         while not self._stop.is_set():
@@ -238,6 +272,8 @@ class QwenRealtimeSpeech:
                     str(error.get("message") or event.get("message") or "未知实时服务错误"),
                     turn_id,
                 )
+            else:
+                logger.debug("Unhandled realtime event: %s", kind)
 
     def _merge_translation_partial(self, text: str, stash: str) -> str:
         """Accept either cumulative snapshots or incremental deltas from the API."""

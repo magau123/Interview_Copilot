@@ -31,6 +31,7 @@ class AudioDevice:
 def list_audio_devices() -> tuple[list[AudioDevice], list[AudioDevice]]:
     audio = pyaudio.PyAudio()
     try:
+        default_loopback_index = _default_loopback_index(audio)
         loopbacks = [
             AudioDevice(
                 index=int(info["index"]),
@@ -41,6 +42,10 @@ def list_audio_devices() -> tuple[list[AudioDevice], list[AudioDevice]]:
             )
             for info in audio.get_loopback_device_info_generator()
         ]
+        # Prefer the loopback that matches Windows' current default output.
+        # Capturing Speakers while audio plays on Headphones yields silence.
+        if default_loopback_index is not None:
+            loopbacks.sort(key=lambda device: device.index != default_loopback_index)
         microphones: list[AudioDevice] = []
         for index in range(audio.get_device_count()):
             info = audio.get_device_info_by_index(index)
@@ -58,6 +63,27 @@ def list_audio_devices() -> tuple[list[AudioDevice], list[AudioDevice]]:
         return loopbacks, microphones
     finally:
         audio.terminate()
+
+
+def _default_loopback_index(audio: pyaudio.PyAudio) -> int | None:
+    try:
+        info = audio.get_default_wasapi_loopback()
+    except Exception:  # noqa: BLE001 - optional host capability
+        return None
+    try:
+        return int(info["index"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def pcm16_rms(chunk: bytes) -> float:
+    """Root-mean-square amplitude for a PCM16 mono chunk (0..32767)."""
+    if not chunk:
+        return 0.0
+    samples = np.frombuffer(chunk, dtype=np.int16)
+    if samples.size == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(samples.astype(np.float64) ** 2)))
 
 
 class AudioCapture:

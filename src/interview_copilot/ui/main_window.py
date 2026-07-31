@@ -251,6 +251,40 @@ class MainWindow(QMainWindow):
         self.microphone_combo.clear()
         self.microphone_combo.addItem("不记录我的回答")
         self.microphone_combo.addItems([device.label for device in self.microphones])
+        self._restore_device_selection()
+
+    def _restore_device_selection(self) -> None:
+        if self.loopbacks:
+            selected = 0
+            saved = self.settings.audio_device_index
+            if saved is not None:
+                for index, device in enumerate(self.loopbacks):
+                    if device.index == saved:
+                        selected = index
+                        break
+            self.loopback_combo.setCurrentIndex(selected)
+        if self.microphones:
+            selected_mic = 0
+            saved_mic = self.settings.microphone_device_index
+            if saved_mic is not None:
+                for index, device in enumerate(self.microphones):
+                    if device.index == saved_mic:
+                        selected_mic = index + 1
+                        break
+            self.microphone_combo.setCurrentIndex(selected_mic)
+
+    def _persist_selected_devices(self) -> None:
+        if self.loopbacks and self.loopback_combo.currentIndex() >= 0:
+            self.settings.audio_device_index = self.loopbacks[
+                self.loopback_combo.currentIndex()
+            ].index
+        if self.microphone_combo.currentIndex() <= 0:
+            self.settings.microphone_device_index = None
+        elif self.microphones:
+            self.settings.microphone_device_index = self.microphones[
+                self.microphone_combo.currentIndex() - 1
+            ].index
+        self.store.save(self.settings)
 
     def _ensure_orchestrator(self) -> ConversationOrchestrator:
         self._apply_settings_from_form()
@@ -329,12 +363,12 @@ class MainWindow(QMainWindow):
                 microphone = None
                 if self.microphone_combo.currentIndex() > 0:
                     microphone = self.microphones[self.microphone_combo.currentIndex() - 1]
+                self._persist_selected_devices()
                 self._reset_translation_view()
-                await orchestrator.start(
-                    self.loopbacks[self.loopback_combo.currentIndex()], microphone
-                )
+                device = self.loopbacks[self.loopback_combo.currentIndex()]
+                await orchestrator.start(device, microphone)
                 self.start_button.setText("停止")
-                self.statusBar().showMessage("正在监听会议声音")
+                self.statusBar().showMessage(f"正在监听：{device.label}")
         except Exception as exc:
             QMessageBox.critical(self, "无法启动", str(exc))
         finally:

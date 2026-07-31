@@ -8,7 +8,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from time import monotonic
 
-from interview_copilot.audio.capture import AudioCapture, AudioDevice
+from interview_copilot.audio.capture import AudioCapture, AudioDevice, pcm16_rms
 from interview_copilot.config import Settings
 from interview_copilot.knowledge.service import KnowledgeService
 from interview_copilot.memory.service import MemoryService
@@ -21,6 +21,8 @@ from interview_copilot.storage.database import Database
 SpeechHandler = Callable[[SpeechEvent], Awaitable[None] | None]
 AnswerHandler = Callable[[Answer], Awaitable[None] | None]
 logger = logging.getLogger(__name__)
+SILENCE_RMS_THRESHOLD = 40.0
+SILENCE_CHECK_CHUNKS = 25  # ~2.5s at 100ms chunks
 
 
 class ConversationOrchestrator:
@@ -54,6 +56,10 @@ class ConversationOrchestrator:
         self._question_final_at = 0.0
         self._first_answer_recorded = False
         self.answer_enabled = settings.answer_enabled
+        self._silence_chunks = 0
+        self._heard_audio = False
+        self._silence_warned = False
+        self._loopback_label = ""
 
     @property
     def running(self) -> bool:
@@ -67,12 +73,22 @@ class ConversationOrchestrator:
         self._loop = asyncio.get_running_loop()
         self._session_id = self.database.start_session()
         self._app_session_id = ""
+        self._silence_chunks = 0
+        self._heard_audio = False
+        self._silence_warned = False
+        self._loopback_label = loopback_device.label
         await self.interviewer.start()
         if microphone_device is not None:
             await self.candidate.start()
+        await self._emit_speech(
+            SpeechEvent(
+                SpeechEventType.STATUS,
+                f"正在采集：{loopback_device.label}\n请确认播放设备与该项一致，否则会听不到系统声音。",
+            )
+        )
         self._interviewer_capture = AudioCapture(
             loopback_device,
-            lambda chunk: self._push_threadsafe(self.interviewer, chunk),
+            lambda chunk: self._on_loopback_audio(chunk),
             self._audio_error,
         )
         self._interviewer_capture.start()
@@ -117,6 +133,26 @@ class ConversationOrchestrator:
     def _push_threadsafe(self, provider: QwenRealtimeSpeech, chunk: bytes) -> None:
         if self._loop and not self._loop.is_closed():
             self._loop.call_soon_threadsafe(provider.push_audio, chunk)
+
+    def _on_loopback_audio(self, chunk: bytes) -> None:
+        self._push_threadsafe(self.interviewer, chunk)
+        if self._heard_audio or self._silence_warned or not self._loop or self._loop.is_closed():
+            return
+        level = pcm16_rms(chunk)
+        if level >= SILENCE_RMS_THRESHOLD:
+            self._heard_audio = True
+            return
+        self._silence_chunks += 1
+        if self._silence_chunks < SILENCE_CHECK_CHUNKS:
+            return
+        self._silence_warned = True
+        event = SpeechEvent(
+            SpeechEventType.STATUS,
+            "当前系统声音设备几乎没有音频输入。\n"
+            f"正在使用：{self._loopback_label}\n"
+            "请切换到正在播放声音的设备（例如 Headphones / 当前默认输出），然后重新开始。",
+        )
+        self._loop.call_soon_threadsafe(asyncio.create_task, self._emit_speech(event))
 
     def _audio_error(self, message: str) -> None:
         if self._loop and not self._loop.is_closed():
