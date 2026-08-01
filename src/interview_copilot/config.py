@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import keyring
@@ -24,11 +24,22 @@ class Settings:
     answer_max_tokens: int = 800
     retrieval_limit: int = 3
     display_font_size: int = 16
-    answer_font_size: int = 11
+    answer_font_size: int = 20
     answer_enabled: bool = False
+    # Teleprompter: reading pace and how loud the mic must be to count as speech.
+    teleprompter_wpm: int = 130
+    teleprompter_threshold: int = 250
+    teleprompter_follow_voice: bool = True
+    # Whole-window transparency: 0 = opaque, higher fades the entire app.
+    background_transparency_percent: int = 45
     knowledge_app_id: str = "aid-433c2467738a4ae1948488f117508609"
     audio_device_index: int | None = None
     microphone_device_index: int | None = None
+    overlays_pinned: bool = False
+    # Floating panel placement as [x, y, width, height]; empty means "pick a default".
+    translation_geometry: list[int] = field(default_factory=list)
+    answer_geometry: list[int] = field(default_factory=list)
+    console_geometry: list[int] = field(default_factory=list)
 
     @property
     def data_dir(self) -> Path:

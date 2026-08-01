@@ -6,8 +6,6 @@ __pycache__/
 .Python
 *.egg-info/
 .eggs/
-dist/
-build/
 *.egg
 
 # Virtual environments
@@ -37,6 +35,9 @@ Thumbs.db
 !**/certifi/cacert.pem
 tmp_kb_stream.txt
 
-# PyInstaller
+# PyInstaller build outputs (do not commit)
+dist/
+build/
 *.manifest
 *.spec.bak
+InterviewCopilot.spec.bak

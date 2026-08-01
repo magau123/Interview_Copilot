@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import re
 from collections.abc import Awaitable, Callable
 
 import httpx
@@ -37,13 +38,56 @@ def build_interview_prompt(question: str, translation: str = "", recent_context:
 近期对话上下文:
 {recent_context.strip() or "（无）"}
 
-请结合知识库，只输出一段适合面试作答的中文回复。
+请结合知识库输出两节内容，严格使用下面的分节标记，不要输出其他标题或解释：
+
+[EN]
+（面试时可以直接照读的英文回答；口语化，短句，每句不超过 18 个词，一句一行）
+[ZH]
+（同一份回答的中文，便于我快速确认意思；一句一行，与英文顺序一致）
+
 要求：
-- 不要输出英文
+- 两节内容表达同一份回答，不要在英文里夹中文，也不要在中文里夹英文
 - 个人经历、项目、指标只能来自知识库，禁止编造
 - 若知识库没有相关材料，明确说明依据不足，并给出可信的通用回答
 - 按问题复杂度控制篇幅：简单题 1-3 句；经历/行为题约 45-60 秒口述长度
 """
+
+
+_SECTION_LINE_RE = re.compile(
+    r"(?im)^[\s>*#-]*[\[【(]?\s*(en|english|英文|英文回答|英文口述稿|zh|chinese|中文|中文回答|中文对照)"
+    r"\s*[\]】)]?\s*[:：]?\s*$"
+)
+_SECTION_INLINE_RE = re.compile(r"(?i)[\[【]\s*(en|english|zh|chinese)\s*[\]】]")
+_ENGLISH_LABELS = {"en", "english", "英文", "英文回答", "英文口述稿"}
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+def _looks_chinese(text: str) -> bool:
+    stripped = "".join(text.split())
+    if not stripped:
+        return False
+    return len(_CJK_RE.findall(stripped)) / len(stripped) > 0.15
+
+
+def split_bilingual_answer(text: str) -> tuple[str, str]:
+    """Split a '[EN] … [ZH] …' payload, tolerating missing or renamed markers."""
+    body = text.strip()
+    if not body:
+        return "", ""
+    matches = list(_SECTION_LINE_RE.finditer(body)) or list(_SECTION_INLINE_RE.finditer(body))
+    sections: dict[str, list[str]] = {"en": [], "zh": []}
+    if matches:
+        for index, match in enumerate(matches):
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(body)
+            label = match.group(1).strip().lower()
+            key = "en" if label in _ENGLISH_LABELS else "zh"
+            sections[key].append(body[match.end() : end].strip())
+        english = "\n".join(part for part in sections["en"] if part).strip()
+        chinese = "\n".join(part for part in sections["zh"] if part).strip()
+        if english or chinese:
+            return english, chinese
+    # No usable markers: keep the text in whichever field matches its script.
+    return ("", body) if _looks_chinese(body) else (body, "")
 
 
 def classify_application_error(code: str, message: str) -> str:
@@ -131,7 +175,7 @@ async def stream_application_answer(
         "stream": True,
     }
 
-    answer = Answer()
+    raw = ""
     async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=20.0)) as client:
         async with client.stream("POST", url, headers=headers, json=payload) as response:
             if response.status_code >= 400:
@@ -160,11 +204,15 @@ async def stream_application_answer(
                 chunk = _assistant_delta(event)
                 if not chunk:
                     continue
-                answer = Answer(chinese=answer.chinese + chunk)
-                result = on_update(answer)
-                if inspect.isawaitable(result):
-                    await result
+                # Accumulate only; UI shows the complete answer once at the end.
+                raw += chunk
 
+    english, chinese = split_bilingual_answer(raw)
+    answer = Answer(english=english, chinese=chinese)
+    if english or chinese:
+        result = on_update(answer)
+        if inspect.isawaitable(result):
+            await result
     return answer, ""
 
 
@@ -173,7 +221,7 @@ async def test_application_connection(settings: Settings, api_key: str) -> str:
     chunks: list[str] = []
 
     async def _collect(answer: Answer) -> None:
-        chunks.append(answer.chinese)
+        chunks.append(answer.chinese or answer.english)
 
     answer, _session = await stream_application_answer(
         settings,
@@ -183,7 +231,7 @@ async def test_application_connection(settings: Settings, api_key: str) -> str:
         recent_context="",
         on_update=_collect,
     )
-    preview = (answer.chinese or "".join(chunks)).strip()
+    preview = (answer.chinese or answer.english or "".join(chunks)).strip()
     if not preview:
         raise RuntimeError("知识库应用返回为空，请检查应用是否已发布并挂载知识库。")
     return (

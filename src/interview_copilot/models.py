@@ -10,6 +10,8 @@ class SpeechEventType(StrEnum):
     SOURCE_FINAL = "source_final"
     TRANSLATION_PARTIAL = "translation_partial"
     TRANSLATION_FINAL = "translation_final"
+    # A question passed the interjection filter and an answer is being generated.
+    ANSWER_PENDING = "answer_pending"
     ERROR = "error"
     STATUS = "status"
 

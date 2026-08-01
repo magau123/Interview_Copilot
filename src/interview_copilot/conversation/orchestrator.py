@@ -10,6 +10,12 @@ from time import monotonic
 
 from interview_copilot.audio.capture import AudioCapture, AudioDevice, pcm16_rms
 from interview_copilot.config import Settings
+from interview_copilot.conversation.question_filter import (
+    is_answerable_question,
+    is_continuation,
+    is_similar,
+    merge_question,
+)
 from interview_copilot.knowledge.service import KnowledgeService
 from interview_copilot.memory.service import MemoryService
 from interview_copilot.models import Answer, SpeechEvent, SpeechEventType
@@ -23,6 +29,13 @@ AnswerHandler = Callable[[Answer], Awaitable[None] | None]
 logger = logging.getLogger(__name__)
 SILENCE_RMS_THRESHOLD = 40.0
 SILENCE_CHECK_CHUNKS = 25  # ~2.5s at 100ms chunks
+# Wait briefly so the Chinese translation can land before querying the knowledge app.
+TRANSLATION_WAIT_SECONDS = 2.5
+# A fragment arriving this soon after a question is treated as the same question,
+# which happens whenever the interviewer pauses mid sentence.
+CONTINUATION_SECONDS = 4.0
+# Re-finalising the same sentence within this window must not re-trigger the app.
+REPEAT_SECONDS = 12.0
 
 
 class ConversationOrchestrator:
@@ -50,7 +63,10 @@ class ConversationOrchestrator:
         self._session_id: int | None = None
         self._last_turn_id: int | None = None
         self._last_question = ""
+        self._answered_question = ""
+        self._answered_at = 0.0
         self._translation = ""
+        self._translation_event = asyncio.Event()
         self._answer_task: asyncio.Task[None] | None = None
         self._app_session_id = ""
         self._question_final_at = 0.0
@@ -83,7 +99,7 @@ class ConversationOrchestrator:
         await self._emit_speech(
             SpeechEvent(
                 SpeechEventType.STATUS,
-                f"正在采集：{loopback_device.label}\n请确认播放设备与该项一致，否则会听不到系统声音。",
+                f"正在采集：{loopback_device.label} · 请确认与 Teams 播放设备一致",
             )
         )
         self._interviewer_capture = AudioCapture(
@@ -121,9 +137,18 @@ class ConversationOrchestrator:
     async def generate_for_text(self, question: str, translation: str = "") -> None:
         if not self.answer_enabled:
             return
+        cleaned = question.strip()
+        if not cleaned:
+            return
+        self._last_question = cleaned
+        self._answered_question = cleaned
+        self._answered_at = monotonic()
+        self._translation = translation.strip()
+        self._translation_event.set()
         self._question_final_at = monotonic()
         self._first_answer_recorded = False
-        await self._schedule_answer(question.strip(), translation.strip())
+        await self._emit_speech(SpeechEvent(SpeechEventType.ANSWER_PENDING, cleaned))
+        await self._schedule_answer(cleaned, self._translation, wait_for_translation=False)
 
     def set_answer_enabled(self, enabled: bool) -> None:
         self.answer_enabled = enabled
@@ -150,7 +175,7 @@ class ConversationOrchestrator:
             SpeechEventType.STATUS,
             "当前系统声音设备几乎没有音频输入。\n"
             f"正在使用：{self._loopback_label}\n"
-            "请切换到正在播放声音的设备（例如 Headphones / 当前默认输出），然后重新开始。",
+            "请切换到 Teams 正在播放的设备，然后重新开始。",
         )
         self._loop.call_soon_threadsafe(asyncio.create_task, self._emit_speech(event))
 
@@ -163,6 +188,7 @@ class ConversationOrchestrator:
         await self._emit_speech(event)
         if event.kind == SpeechEventType.TRANSLATION_FINAL:
             self._translation = event.text.strip()
+            self._translation_event.set()
             if self._question_final_at:
                 logger.info(
                     "METRIC translation_after_final_ms %.1f",
@@ -171,19 +197,45 @@ class ConversationOrchestrator:
             if self._last_turn_id and self._translation:
                 self.database.update_turn_translation(self._last_turn_id, self._translation)
         elif event.kind == SpeechEventType.SOURCE_FINAL:
-            question = event.text.strip()
-            if len(question.split()) < 3:
+            await self._handle_interviewer_final(event.text.strip())
+
+    async def _handle_interviewer_final(self, question: str) -> None:
+        """Answer real questions only; ignore backchannel, noise and repeats."""
+        if not question:
+            return
+        now = monotonic()
+        answered_recently = bool(self._answered_question) and (
+            now - self._answered_at <= CONTINUATION_SECONDS
+        )
+        if is_answerable_question(question):
+            if (
+                self._answered_question
+                and now - self._answered_at <= REPEAT_SECONDS
+                and is_similar(question, self._answered_question)
+            ):
+                logger.info("Skipping repeated question: %s", question)
                 return
-            self._last_question = question
-            self._translation = ""
-            self._question_final_at = monotonic()
-            self._first_answer_recorded = False
-            if self._session_id is not None:
-                self._last_turn_id = self.database.add_turn(
-                    self._session_id, "interviewer", question
-                )
-            if self.answer_enabled:
-                await self._schedule_answer(question, self._translation)
+        elif answered_recently and is_continuation(question):
+            question = merge_question(self._answered_question, question)
+        else:
+            await self._emit_speech(
+                SpeechEvent(SpeechEventType.STATUS, f"已忽略插话/杂音：{question}")
+            )
+            logger.info("Skipping non-question utterance: %s", question)
+            return
+
+        self._last_question = question
+        self._answered_question = question
+        self._answered_at = now
+        self._translation = ""
+        self._translation_event = asyncio.Event()
+        self._question_final_at = now
+        self._first_answer_recorded = False
+        if self._session_id is not None:
+            self._last_turn_id = self.database.add_turn(self._session_id, "interviewer", question)
+        if self.answer_enabled:
+            await self._emit_speech(SpeechEvent(SpeechEventType.ANSWER_PENDING, question))
+            await self._schedule_answer(question, "", wait_for_translation=True)
 
     async def _on_candidate_event(self, event: SpeechEvent) -> None:
         if event.kind == SpeechEventType.SOURCE_FINAL and self._session_id is not None:
@@ -191,19 +243,45 @@ class ConversationOrchestrator:
             if text:
                 self.database.add_turn(self._session_id, "candidate", text)
 
-    async def _schedule_answer(self, question: str, translation: str) -> None:
+    async def _schedule_answer(
+        self,
+        question: str,
+        translation: str,
+        *,
+        wait_for_translation: bool,
+    ) -> None:
         if not question:
             return
         if self._answer_task and not self._answer_task.done():
             self._answer_task.cancel()
         request_id = uuid.uuid4().hex
         self._answer_task = asyncio.create_task(
-            self._answer(question, translation, request_id), name=f"answer-{request_id[:8]}"
+            self._answer(question, translation, request_id, wait_for_translation),
+            name=f"answer-{request_id[:8]}",
         )
 
-    async def _answer(self, question: str, translation: str, request_id: str) -> None:
+    async def _answer(
+        self,
+        question: str,
+        translation: str,
+        request_id: str,
+        wait_for_translation: bool,
+    ) -> None:
         try:
-            translation = self._translation if question == self._last_question else translation
+            if wait_for_translation and question == self._last_question and not self._translation:
+                await self._emit_speech(
+                    SpeechEvent(SpeechEventType.STATUS, "等待中文翻译后生成回答…", request_id)
+                )
+                with suppress(TimeoutError):
+                    await asyncio.wait_for(
+                        self._translation_event.wait(),
+                        timeout=TRANSLATION_WAIT_SECONDS,
+                    )
+            if question == self._last_question and self._translation:
+                translation = self._translation
+            await self._emit_speech(
+                SpeechEvent(SpeechEventType.STATUS, "正在从知识库生成完整回答…", request_id)
+            )
             context = (
                 self.database.recent_context(self._session_id, limit=4)
                 if self._session_id is not None
@@ -218,6 +296,7 @@ class ConversationOrchestrator:
                 self._emit_answer,
                 session_id=self._app_session_id,
             )
+            await self._emit_speech(SpeechEvent(SpeechEventType.STATUS, "回答已就绪", request_id))
         except asyncio.CancelledError:
             raise
         except Exception as exc:

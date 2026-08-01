@@ -9,23 +9,48 @@ from interview_copilot.config import Settings
 from interview_copilot.models import Answer
 from interview_copilot.providers.qwen import application as application_mod
 from interview_copilot.providers.qwen.application import (
+    _assistant_delta,
     build_interview_prompt,
     classify_application_error,
     knowledge_chat_url,
+    split_bilingual_answer,
     stream_application_answer,
-    _assistant_delta,
 )
 
 
-def test_build_interview_prompt_is_chinese_only() -> None:
+def test_build_interview_prompt_asks_for_bilingual_sections() -> None:
     prompt = build_interview_prompt(
         "Tell me about yourself.",
         "请介绍一下你自己。",
         "interviewer: Hello",
     )
     assert "请介绍一下你自己。" in prompt
-    assert "只输出一段适合面试作答的中文回复" in prompt
-    assert "[EN]" not in prompt
+    assert "[EN]" in prompt
+    assert "[ZH]" in prompt
+
+
+def test_split_bilingual_answer_reads_marked_sections() -> None:
+    english, chinese = split_bilingual_answer(
+        "[EN]\nI led the billing migration.\nIt cut latency in half.\n"
+        "[ZH]\n我主导了计费迁移。\n延迟降低了一半。"
+    )
+    assert english == "I led the billing migration.\nIt cut latency in half."
+    assert chinese == "我主导了计费迁移。\n延迟降低了一半。"
+
+
+def test_split_bilingual_answer_accepts_localised_headings() -> None:
+    english, chinese = split_bilingual_answer("英文：\nHello there.\n中文对照\n你好。")
+    assert english == "Hello there."
+    assert chinese == "你好。"
+
+
+def test_split_bilingual_answer_falls_back_to_script_detection() -> None:
+    assert split_bilingual_answer("我来自知识库。") == ("", "我来自知识库。")
+    assert split_bilingual_answer("I come from the knowledge base.") == (
+        "I come from the knowledge base.",
+        "",
+    )
+    assert split_bilingual_answer("   ") == ("", "")
 
 
 def test_knowledge_chat_url_uses_workspace_host() -> None:
@@ -120,7 +145,7 @@ async def test_stream_application_answer_parses_sse_deltas(
                     {
                         "message": {
                             "role": "assistant",
-                            "content": "我",
+                            "content": "[EN]\nI come from the knowledge base.\n[ZH]\n我",
                             "extra": {"step": "generating"},
                         }
                     }
@@ -155,7 +180,7 @@ async def test_stream_application_answer_parses_sse_deltas(
         )
         assert body["input"]["messages"][0]["role"] == "user"
         payload = b"".join(
-            f"data:{json.dumps(event, ensure_ascii=False)}\n\n".encode("utf-8")
+            f"data:{json.dumps(event, ensure_ascii=False)}\n\n".encode()
             for event in events
         )
         return httpx.Response(200, content=payload)
@@ -174,10 +199,10 @@ async def test_stream_application_answer_parses_sse_deltas(
         region="cn-beijing",
         workspace_id="llm-x0jmmfp7f7vu9rc5",
     )
-    updates: list[str] = []
+    updates: list[Answer] = []
 
     async def on_update(answer: Answer) -> None:
-        updates.append(answer.chinese)
+        updates.append(answer)
 
     answer, session_id = await stream_application_answer(
         settings,
@@ -188,7 +213,9 @@ async def test_stream_application_answer_parses_sse_deltas(
         on_update,
     )
 
+    assert answer.english == "I come from the knowledge base."
     assert answer.chinese == "我来自知识库。"
     assert session_id == ""
-    assert updates[-1] == "我来自知识库。"
-    assert all("检索结果不应展示" not in item for item in updates)
+    assert len(updates) == 1
+    assert updates[0].chinese == "我来自知识库。"
+    assert "检索结果不应展示" not in updates[0].chinese
