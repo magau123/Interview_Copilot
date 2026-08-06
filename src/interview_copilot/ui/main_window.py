@@ -4,7 +4,7 @@ import asyncio
 import html
 
 from PySide6.QtCore import QPoint, Qt, QTimer
-from PySide6.QtGui import QTextCursor
+from PySide6.QtGui import QKeySequence, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -128,8 +128,8 @@ class MainWindow(QMainWindow):
         self._question_en = ""
         self._question_zh = ""
         self._script = Answer()
-        self._pending_answer: Answer | None = None
         self._answer_pending = False
+        self._streaming_active = False
         self._rendered_script_html = ""
         self._ledger = TranslationLedger()
         self._voice = VoiceActivityMonitor(self.settings.teleprompter_threshold)
@@ -165,7 +165,7 @@ class MainWindow(QMainWindow):
 
         self.answer_view = TeleprompterView()
         self.answer_view.setObjectName("panelCard")
-        self.answer_view.set_guide_visible(True)
+        self.answer_view.set_guide_visible(False)
         self.answer_view.runningChanged.connect(self._on_scroll_running_changed)
 
         self.translation_overlay = OverlayWindow(
@@ -221,7 +221,7 @@ class MainWindow(QMainWindow):
         actions = QHBoxLayout()
         actions.setSpacing(8)
         self.answer_toggle = QCheckBox("回答建议")
-        self.answer_toggle.setToolTip("开启后，问题结束后会从阿里云知识库应用拉取完整回答")
+        self.answer_toggle.setToolTip("开启后显示提词器，并可手动生成英文回答")
         self.answer_toggle.toggled.connect(self._on_answer_toggled)
         self.follow_toggle = QCheckBox("跟读滚动")
         self.follow_toggle.setToolTip("我一开口就滚动，停下就暂停（只用本地音量判断）")
@@ -229,19 +229,26 @@ class MainWindow(QMainWindow):
         self.pin_toggle = QCheckBox("置顶")
         self.pin_toggle.setToolTip("让两个显示框浮在 Teams 上方；关闭后会被其他窗口盖住")
         self.pin_toggle.toggled.connect(self._on_pin_toggled)
-        self.switch_button = QPushButton("切换新回答（F4）")
-        self.switch_button.setObjectName("accent")
-        self.switch_button.setShortcut("F4")
-        self.switch_button.setToolTip("面试官问了新问题；点击后才替换正在读的稿子")
-        self.switch_button.clicked.connect(self.apply_pending_answer)
-        self.switch_button.setEnabled(False)
+        self.scope_combo = QComboBox()
+        self.scope_combo.addItem("基于最近 1 句", 1)
+        self.scope_combo.addItem("基于最近 2 句", 2)
+        self.scope_combo.addItem("基于最近 3 句", 3)
+        self.scope_combo.setToolTip(
+            "生成答案时取面试官最近几句英文原文发给百炼（Ctrl+1 / Ctrl+2 / Ctrl+3）"
+        )
+        self.generate_button = QPushButton("生成答案（F4）")
+        self.generate_button.setObjectName("accent")
+        self.generate_button.setShortcut("F4")
+        self.generate_button.setToolTip(
+            "按所选范围取面试官原话并流式生成；也可直接按 Ctrl+1 / Ctrl+2 / Ctrl+3"
+        )
+        self.generate_button.clicked.connect(self.generate_answer)
+        self._install_generate_shortcuts()
         self.scroll_button = QPushButton("手动滚动（F2）")
         self.scroll_button.setShortcut("F2")
         self.scroll_button.clicked.connect(self._toggle_scroll)
         self.rewind_button = QPushButton("回到开头")
         self.rewind_button.clicked.connect(self._rewind_script)
-        self.regenerate_button = QPushButton("重新生成")
-        self.regenerate_button.clicked.connect(self.regenerate)
         self.level_bar = QProgressBar()
         self.level_bar.setObjectName("levelBar")
         self.level_bar.setRange(0, 100)
@@ -261,10 +268,10 @@ class MainWindow(QMainWindow):
         actions.addWidget(self.answer_toggle)
         actions.addWidget(self.follow_toggle)
         actions.addWidget(self.pin_toggle)
-        actions.addWidget(self.switch_button)
+        actions.addWidget(self.scope_combo)
+        actions.addWidget(self.generate_button)
         actions.addWidget(self.scroll_button)
         actions.addWidget(self.rewind_button)
-        actions.addWidget(self.regenerate_button)
         actions.addWidget(self.level_bar, 1)
         actions.addWidget(self.transparency_label)
         actions.addWidget(self.transparency_slider)
@@ -359,8 +366,10 @@ class MainWindow(QMainWindow):
     def _show_overlay_menu(self, position: QPoint) -> None:
         menu = QMenu(self)
         menu.setStyleSheet(STYLESHEET)
-        if self._pending_answer is not None:
-            menu.addAction("切换到新回答", self.apply_pending_answer)
+        menu.addAction("生成答案（当前范围）", self.generate_answer)
+        menu.addAction("基于最近 1 句（Ctrl+1）", self.generate_from_last_1)
+        menu.addAction("基于最近 2 句（Ctrl+2）", self.generate_from_last_2)
+        menu.addAction("基于最近 3 句（Ctrl+3）", self.generate_from_last_3)
         menu.addAction(
             "暂停滚动" if self.answer_view.running else "开始滚动", self._toggle_scroll
         )
@@ -477,23 +486,63 @@ class MainWindow(QMainWindow):
         finally:
             self.start_button.setEnabled(True)
 
+    def _install_generate_shortcuts(self) -> None:
+        """Ctrl+1/2/3 generate from the last N interviewer sentences."""
+        self._generate_shortcuts: list[QShortcut] = []
+        handlers = {
+            1: self.generate_from_last_1,
+            2: self.generate_from_last_2,
+            3: self.generate_from_last_3,
+        }
+        for count, handler in handlers.items():
+            shortcut = QShortcut(QKeySequence(f"Ctrl+{count}"), self)
+            shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+            shortcut.activated.connect(handler)
+            self._generate_shortcuts.append(shortcut)
+
     @asyncSlot()
-    async def regenerate(self) -> None:
-        question = self._question_en.strip()
-        if not question:
+    async def generate_answer(self) -> None:
+        count = int(self.scope_combo.currentData() or 1)
+        await self._generate_answer_for(count)
+
+    @asyncSlot()
+    async def generate_from_last_1(self) -> None:
+        await self._generate_answer_for(1)
+
+    @asyncSlot()
+    async def generate_from_last_2(self) -> None:
+        await self._generate_answer_for(2)
+
+    @asyncSlot()
+    async def generate_from_last_3(self) -> None:
+        await self._generate_answer_for(3)
+
+    async def _generate_answer_for(self, count: int) -> None:
+        if not self.answer_toggle.isChecked():
+            QMessageBox.information(self, "生成答案", "请先开启「回答建议」。")
             return
+        count = max(1, min(3, int(count)))
+        index = self.scope_combo.findData(count)
+        if index >= 0:
+            self.scope_combo.setCurrentIndex(index)
+        sentences = self._recent_interviewer_english(count)
+        if not sentences:
+            QMessageBox.warning(self, "生成答案", "还没有可用来生成回答的面试官英文原话。")
+            return
+        question = "\n".join(sentences)
         try:
-            # An explicit request replaces the script, so drop the current one.
             self._script = Answer()
-            self._pending_answer = None
-            self._set_pending_alert(False)
             self._answer_pending = True
+            self._streaming_active = True
+            self.answer_overlay.set_alert(False)
             self._render_answer()
-            await self._ensure_orchestrator().generate_for_text(
-                question, self._question_zh.strip()
+            self.statusBar().showMessage(
+                f"正在基于最近 {len(sentences)} 句生成回答…", 5000
             )
+            await self._ensure_orchestrator().generate_for_text(question)
         except Exception as exc:
             self._answer_pending = False
+            self._streaming_active = False
             self._render_answer()
             QMessageBox.warning(self, "无法生成", str(exc))
 
@@ -512,62 +561,71 @@ class MainWindow(QMainWindow):
             self._sync_from_ledger()
         elif event.kind == SpeechEventType.ANSWER_PENDING:
             self._answer_pending = True
-            self._render_answer()
+            self._streaming_active = True
+            if not self._has_script():
+                self._render_answer()
         elif event.kind == SpeechEventType.STATUS:
+            if event.text == "回答已就绪":
+                self._answer_pending = False
+                self._streaming_active = False
             self.statusBar().showMessage(event.text)
         elif event.kind == SpeechEventType.ERROR:
             self._answer_pending = False
+            self._streaming_active = False
             self._render_answer()
             self.statusBar().showMessage(event.text, 8000)
 
     def on_answer(self, answer: Answer) -> None:
         if not self.answer_toggle.isChecked():
             return
-        self._answer_pending = False
-        if self._has_script():
-            # Never pull the script away from someone reading it out loud.
-            self._pending_answer = answer
-            self._set_pending_alert(True)
-            self.statusBar().showMessage("新回答已就绪，按 F4 或在提词器上右键切换", 8000)
-        else:
-            self._apply_answer(answer)
-
-    def apply_pending_answer(self) -> None:
-        if self._pending_answer is None:
+        english = answer.english.strip()
+        if not english:
             return
-        self._apply_answer(self._pending_answer)
-        self.statusBar().showMessage("已切换到新回答", 3000)
+        preserve = self._has_script()
+        self._streaming_active = True
+        self._apply_answer(answer, streaming=preserve)
 
-    def _apply_answer(self, answer: Answer) -> None:
-        self._script = answer
-        self._pending_answer = None
-        self._answer_pending = False
-        self._set_pending_alert(False)
-        self._render_answer()
-        self.answer_view.rewind()
-
-    def _set_pending_alert(self, pending: bool) -> None:
-        """The console button and the panel frame both flag a waiting answer."""
-        self.switch_button.setEnabled(pending)
-        self.answer_overlay.set_alert(pending)
+    def _apply_answer(self, answer: Answer, *, streaming: bool = False) -> None:
+        self._script = Answer(english=answer.english.strip(), chinese="", sources=answer.sources)
+        if not streaming:
+            self._answer_pending = False
+            self._streaming_active = False
+            self.answer_overlay.set_alert(False)
+        self._render_answer(preserve_scroll=streaming)
+        if not streaming:
+            self.answer_view.rewind()
 
     def _has_script(self) -> bool:
-        return bool(self._script.english.strip() or self._script.chinese.strip())
+        return bool(self._script.english.strip())
 
     def _reset_views(self) -> None:
         self._ledger.reset()
         self._question_en = ""
         self._question_zh = ""
         self._script = Answer()
-        self._pending_answer = None
         self._answer_pending = False
-        self._set_pending_alert(False)
+        self._streaming_active = False
+        self.answer_overlay.set_alert(False)
         self._render_translation()
         self._render_answer()
 
     def _sync_from_ledger(self) -> None:
         self._question_en, self._question_zh = self._ledger.latest()
         self._render_translation()
+
+    def _recent_interviewer_english(self, count: int) -> list[str]:
+        """Latest finalized interviewer English lines, newest last."""
+        items: list[str] = []
+        for english, _chinese in self._ledger.history_pairs():
+            cleaned = english.strip()
+            if cleaned:
+                items.append(cleaned)
+        current = self._question_en.strip()
+        if current and (not items or items[-1] != current):
+            items.append(current)
+        if count <= 0:
+            return []
+        return items[-count:]
 
     def _context_pairs(self) -> list[tuple[str, str]]:
         """Completed bilingual turns immediately before the active sentence."""
@@ -621,7 +679,7 @@ class MainWindow(QMainWindow):
         scrollbar = view.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
-    def _render_answer(self) -> None:
+    def _render_answer(self, *, preserve_scroll: bool = False) -> None:
         if not self.answer_toggle.isChecked():
             body = self._plain_block(
                 "已关闭回答建议。左侧仍会实时显示英文原文和中文翻译。",
@@ -633,7 +691,7 @@ class MainWindow(QMainWindow):
             body = self._plain_block("正在从知识库生成回答…", placeholder=True)
         else:
             body = self._plain_block(
-                "面试官问完一题后，可直接照读的英文稿会出现在这里。",
+                "Ctrl+1 / Ctrl+2 / Ctrl+3 或点生成答案，英文稿会流式出现在这里。",
                 placeholder=True,
             )
         html_body = self._card_html(body, font_size=self.settings.answer_font_size)
@@ -641,15 +699,14 @@ class MainWindow(QMainWindow):
             # Re-setting identical HTML would rewind the scroll mid-sentence.
             return
         self._rendered_script_html = html_body
-        self.answer_view.set_script(html_body, self._script_plain_text())
+        self.answer_view.set_script(
+            html_body,
+            self._script_plain_text(),
+            preserve_scroll=preserve_scroll,
+        )
 
     def _script_blocks(self) -> str:
-        blocks = [self._script_lines(self._script.english, "scriptEn")]
-        chinese = self._script.chinese.strip()
-        if chinese:
-            blocks.append('<div class="scriptDivider"></div>')
-            blocks.append(self._script_lines(chinese, "scriptZh"))
-        return "".join(block for block in blocks if block)
+        return self._script_lines(self._script.english, "scriptEn")
 
     @staticmethod
     def _script_lines(text: str, klass: str) -> str:
@@ -657,8 +714,8 @@ class MainWindow(QMainWindow):
         return "".join(f'<div class="{klass}">{html.escape(line)}</div>' for line in lines)
 
     def _script_plain_text(self) -> str:
-        """Only the part that is read aloud sets the scrolling pace."""
-        return self._script.english.strip() or self._script.chinese.strip()
+        """Only the spoken English script sets the scrolling pace."""
+        return self._script.english.strip()
 
     def _set_card_html(
         self,
@@ -671,7 +728,6 @@ class MainWindow(QMainWindow):
 
     def _card_html(self, block: str, *, font_size: int) -> str:
         placeholder_size = max(12, font_size - 1)
-        script_zh_size = max(13, int(font_size * 0.7))
         return f"""
             <style>
               body {{
@@ -718,16 +774,6 @@ class MainWindow(QMainWindow):
                 font-size: {font_size}px;
                 line-height: 1.5;
                 margin: 0 0 10px 0;
-              }}
-              .scriptZh {{
-                color: #33424f;
-                font-size: {script_zh_size}px;
-                line-height: 1.45;
-                margin: 0 0 6px 0;
-              }}
-              .scriptDivider {{
-                border-top: 1px solid #b3bcc5;
-                margin: 18px 0 14px 0;
               }}
             </style>
             {block}
@@ -832,10 +878,11 @@ class MainWindow(QMainWindow):
     def _on_answer_toggled(self, enabled: bool) -> None:
         self.settings.answer_enabled = enabled
         self._script = Answer()
-        self._pending_answer = None
         self._answer_pending = False
-        self._set_pending_alert(False)
-        self.regenerate_button.setEnabled(enabled)
+        self._streaming_active = False
+        self.answer_overlay.set_alert(False)
+        self.generate_button.setEnabled(enabled)
+        self.scope_combo.setEnabled(enabled)
         self.answer_overlay.setVisible(enabled and self.isVisible())
         if not enabled:
             self.answer_view.set_running(False)

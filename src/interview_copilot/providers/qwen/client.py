@@ -50,30 +50,22 @@ class QwenClient:
             f"[{source.document_name}]\n{source.text}" for source in sources
         )
         chinese_question = (translation or "").strip()
-        prompt = f"""面试官问题（英文原文）:
+        prompt = f"""Interview question (English):
 {question}
 
-面试官问题（中文翻译）:
-{chinese_question or "（暂无）"}
+Interview question (Chinese translation, for context only):
+{chinese_question or "(none)"}
 
-近期对话上下文:
-{recent_context or "（无）"}
+Recent dialogue context:
+{recent_context or "(none)"}
 
-知识库检索结果:
-{evidence or "（未检索到相关资料）"}
+Knowledge-base evidence:
+{evidence or "(none)"}
 
-请只输出一段适合面试作答的中文回复，不要输出英文，不要使用 [EN]/[ZH] 等标记。
-
-长度要求:
-- 问候、确认、定义、简单事实题：用 1-3 句简短回答
-- 行为、项目、经历、动机、优劣势、冲突、领导力、情景题：给出约 45-60 秒口述长度的中文回答，\
-尽量结合知识库中的具体经历；适合时用精简 STAR，但不要标注段落标题
-- 技术解释题：给出约 30-45 秒的聚焦回答，除非问题明确要求极短定义
-
-约束:
-- 个人经历、公司、时间、指标、项目只能来自知识库检索结果，禁止编造
-- 若知识库没有相关材料，明确说明依据不足，并给出可信的通用回答，不要编造细节
-- 不要开场寒暄、不要重复收尾、不要多余铺垫
+Write an English interview answer I can read aloud.
+Output English only. No Chinese. No [EN]/[ZH] markers.
+Short spoken sentences, one per line, at most 18 words each.
+Use knowledge-base facts only — do not invent personal details.
 """
         stream = await self.client.chat.completions.create(
             model=self.settings.llm_model,
@@ -81,8 +73,9 @@ class QwenClient:
                 {
                     "role": "system",
                     "content": (
-                        "你是面试助手。根据面试官问题和知识库检索结果，只输出中文回答。"
-                        "回答要贴合问题，依据证据，禁止编造个人事实。"
+                        "You are an interview assistant. Using the question and "
+                        "knowledge-base evidence, output English-only spoken answers. "
+                        "Do not invent personal facts."
                     ),
                 },
                 {"role": "user", "content": prompt},
@@ -109,11 +102,6 @@ class QwenClient:
 
 
 def _parse_answer(raw: str, sources: list[Source]) -> Answer:
-    text = (raw or "").strip()
-    chinese = text
-    # Tolerate legacy bilingual markers if the model still emits them.
-    if "[ZH]" in text:
-        chinese = text.split("[ZH]", 1)[1].strip()
-    elif "[EN]" in text:
-        chinese = text.split("[EN]", 1)[0].strip()
-    return Answer(english="", chinese=chinese, sources=sources)
+    from interview_copilot.providers.qwen.application import extract_english_answer
+
+    return Answer(english=extract_english_answer(raw), chinese="", sources=sources)

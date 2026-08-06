@@ -63,13 +63,22 @@ class TeleprompterView(QTextEdit):
         scrollbar = self.verticalScrollBar()
         return scrollbar.value() >= scrollbar.maximum()
 
-    def set_script(self, html: str, plain_text: str = "") -> None:
-        """Load new content and rewind to the first line."""
-        self.set_running(False)
+    def set_script(self, html: str, plain_text: str = "", *, preserve_scroll: bool = False) -> None:
+        """Load content; rewind unless this is an in-place streaming update."""
+        scrollbar = self.verticalScrollBar()
+        previous = scrollbar.value()
+        was_running = self._running
+        if not preserve_scroll:
+            self.set_running(False)
         self.setHtml(html)
         self._units = reading_units(plain_text or self.toPlainText())
         self._add_tail_space()
-        self.rewind()
+        if preserve_scroll:
+            scrollbar.setValue(min(previous, scrollbar.maximum()))
+            if was_running:
+                self.set_running(True)
+        else:
+            self.rewind()
 
     def _add_tail_space(self) -> None:
         """Blank space below the text so the last line can still reach the guide."""

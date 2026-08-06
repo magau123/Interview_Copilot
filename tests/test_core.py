@@ -29,11 +29,11 @@ def test_split_text_respects_size_and_overlap() -> None:
     assert chunks[1].startswith("A" * 80)
 
 
-def test_answer_parser_handles_chinese_only_output() -> None:
+def test_answer_parser_handles_english_only_output() -> None:
     source = Source(1, "resume.pdf", "Built an API", 0.9)
-    answer = _parse_answer("我构建了该服务，并负责线上稳定性。", [source])
-    assert answer.english == ""
-    assert answer.chinese == "我构建了该服务，并负责线上稳定性。"
+    answer = _parse_answer("I built the service and kept it reliable.", [source])
+    assert answer.english == "I built the service and kept it reliable."
+    assert answer.chinese == ""
     assert answer.sources == [source]
 
 
@@ -43,8 +43,8 @@ def test_answer_parser_tolerates_legacy_markers() -> None:
         "[EN]\nI built the service.\n[ZH]\n我构建了该服务。",
         [source],
     )
-    assert answer.english == ""
-    assert answer.chinese == "我构建了该服务。"
+    assert answer.english == "I built the service."
+    assert answer.chinese == ""
     assert answer.sources == [source]
 
 

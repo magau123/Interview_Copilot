@@ -12,7 +12,7 @@ from interview_copilot.storage.database import Database
 
 
 @pytest.mark.asyncio
-async def test_answer_waits_for_translation_before_calling_app(
+async def test_manual_generate_streams_question_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     settings = Settings(answer_enabled=True, knowledge_app_id="aid-test")
@@ -27,19 +27,9 @@ async def test_answer_waits_for_translation_before_calling_app(
     async def on_answer(answer: Answer) -> None:
         answers.append(answer)
 
-    async def fake_stream(
-        _settings,
-        _api_key,
-        question,
-        translation,
-        _context,
-        on_update,
-        *,
-        session_id: str = "",
-    ):
+    async def fake_stream(_settings, _api_key, question, on_update, *, session_id: str = ""):
         seen["question"] = question
-        seen["translation"] = translation
-        answer = Answer(chinese="完整中文回答")
+        answer = Answer(english="I led the billing migration.")
         await on_update(answer)
         return answer, session_id
 
@@ -56,25 +46,20 @@ async def test_answer_waits_for_translation_before_calling_app(
     await orchestrator._on_interviewer_event(
         SpeechEvent(SpeechEventType.SOURCE_FINAL, "Tell me about yourself please.")
     )
-    assert orchestrator._answer_task is not None
-    await asyncio.sleep(0.05)
+    assert orchestrator._answer_task is None
     assert seen == {}
 
-    await orchestrator._on_interviewer_event(
-        SpeechEvent(SpeechEventType.TRANSLATION_FINAL, "请介绍一下你自己。")
-    )
+    await orchestrator.generate_for_text("Tell me about yourself please.")
+    assert orchestrator._answer_task is not None
     await orchestrator._answer_task
 
-    assert seen == {
-        "question": "Tell me about yourself please.",
-        "translation": "请介绍一下你自己。",
-    }
-    assert answers[-1].chinese == "完整中文回答"
-    assert any("知识库" in event.text for event in speech_events)
+    assert seen == {"question": "Tell me about yourself please."}
+    assert answers[-1].english == "I led the billing migration."
+    assert any("正在生成回答" in event.text for event in speech_events)
 
 
 @pytest.mark.asyncio
-async def test_interjections_do_not_trigger_a_new_answer(
+async def test_interjections_do_not_schedule_answers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     settings = Settings(answer_enabled=True, knowledge_app_id="aid-test")
@@ -82,27 +67,15 @@ async def test_interjections_do_not_trigger_a_new_answer(
     questions: list[str] = []
     speech_events: list[SpeechEvent] = []
 
-    async def fake_stream(
-        _settings,
-        _api_key,
-        question,
-        _translation,
-        _context,
-        on_update,
-        *,
-        session_id: str = "",
-    ):
+    async def fake_stream(_settings, _api_key, question, on_update, *, session_id: str = ""):
         questions.append(question)
-        answer = Answer(english="Sure.", chinese="好的。")
+        answer = Answer(english="Sure.")
         await on_update(answer)
         return answer, session_id
 
     monkeypatch.setattr(
         "interview_copilot.conversation.orchestrator.stream_application_answer",
         fake_stream,
-    )
-    monkeypatch.setattr(
-        "interview_copilot.conversation.orchestrator.TRANSLATION_WAIT_SECONDS", 0.01
     )
 
     async def on_speech(event: SpeechEvent) -> None:
@@ -116,47 +89,22 @@ async def test_interjections_do_not_trigger_a_new_answer(
     await orchestrator._on_interviewer_event(
         SpeechEvent(SpeechEventType.SOURCE_FINAL, "What was your role on that project?")
     )
-    await orchestrator._answer_task
+    assert orchestrator._answer_task is None
 
     for noise in ("Okay.", "Mm-hmm", "Got it.", "..."):
         await orchestrator._on_interviewer_event(
             SpeechEvent(SpeechEventType.SOURCE_FINAL, noise)
         )
-    assert questions == ["What was your role on that project?"]
-    assert any(event.kind == SpeechEventType.ANSWER_PENDING for event in speech_events)
+    assert questions == []
     assert any("已忽略插话" in event.text for event in speech_events)
 
 
 @pytest.mark.asyncio
-async def test_split_question_is_merged_instead_of_replacing(
+async def test_split_question_is_merged_for_tracking(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     settings = Settings(answer_enabled=True, knowledge_app_id="aid-test")
     database = Database(tmp_path / "test.db")
-    questions: list[str] = []
-
-    async def fake_stream(
-        _settings,
-        _api_key,
-        question,
-        _translation,
-        _context,
-        on_update,
-        *,
-        session_id: str = "",
-    ):
-        questions.append(question)
-        answer = Answer(chinese="回答")
-        await on_update(answer)
-        return answer, session_id
-
-    monkeypatch.setattr(
-        "interview_copilot.conversation.orchestrator.stream_application_answer",
-        fake_stream,
-    )
-    monkeypatch.setattr(
-        "interview_copilot.conversation.orchestrator.TRANSLATION_WAIT_SECONDS", 0.01
-    )
 
     orchestrator = ConversationOrchestrator(
         settings, "sk-test", database, lambda _event: None, lambda _answer: None
@@ -166,48 +114,21 @@ async def test_split_question_is_merged_instead_of_replacing(
     await orchestrator._on_interviewer_event(
         SpeechEvent(SpeechEventType.SOURCE_FINAL, "Tell me about a hard project")
     )
-    await orchestrator._answer_task
     await orchestrator._on_interviewer_event(
         SpeechEvent(SpeechEventType.SOURCE_FINAL, "and your role in it")
     )
-    await orchestrator._answer_task
 
-    assert questions == [
-        "Tell me about a hard project",
-        "Tell me about a hard project and your role in it",
-    ]
+    assert orchestrator._last_question == (
+        "Tell me about a hard project and your role in it"
+    )
 
 
 @pytest.mark.asyncio
-async def test_repeated_final_does_not_regenerate(
+async def test_repeated_final_does_not_reopen_turn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     settings = Settings(answer_enabled=True, knowledge_app_id="aid-test")
     database = Database(tmp_path / "test.db")
-    questions: list[str] = []
-
-    async def fake_stream(
-        _settings,
-        _api_key,
-        question,
-        _translation,
-        _context,
-        on_update,
-        *,
-        session_id: str = "",
-    ):
-        questions.append(question)
-        answer = Answer(chinese="回答")
-        await on_update(answer)
-        return answer, session_id
-
-    monkeypatch.setattr(
-        "interview_copilot.conversation.orchestrator.stream_application_answer",
-        fake_stream,
-    )
-    monkeypatch.setattr(
-        "interview_copilot.conversation.orchestrator.TRANSLATION_WAIT_SECONDS", 0.01
-    )
 
     orchestrator = ConversationOrchestrator(
         settings, "sk-test", database, lambda _event: None, lambda _answer: None
@@ -217,61 +138,9 @@ async def test_repeated_final_does_not_regenerate(
     await orchestrator._on_interviewer_event(
         SpeechEvent(SpeechEventType.SOURCE_FINAL, "Why did you leave that company?")
     )
-    await orchestrator._answer_task
+    first_turn = orchestrator._last_turn_id
     await orchestrator._on_interviewer_event(
         SpeechEvent(SpeechEventType.SOURCE_FINAL, "Why did you leave that company")
     )
 
-    assert questions == ["Why did you leave that company?"]
-
-
-@pytest.mark.asyncio
-async def test_answer_falls_back_when_translation_times_out(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    settings = Settings(answer_enabled=True, knowledge_app_id="aid-test")
-    database = Database(tmp_path / "test.db")
-    seen: dict[str, str] = {}
-
-    async def fake_stream(
-        _settings,
-        _api_key,
-        question,
-        translation,
-        _context,
-        on_update,
-        *,
-        session_id: str = "",
-    ):
-        seen["question"] = question
-        seen["translation"] = translation
-        answer = Answer(chinese="timeout fallback")
-        await on_update(answer)
-        return answer, session_id
-
-    monkeypatch.setattr(
-        "interview_copilot.conversation.orchestrator.stream_application_answer",
-        fake_stream,
-    )
-    monkeypatch.setattr(
-        "interview_copilot.conversation.orchestrator.TRANSLATION_WAIT_SECONDS",
-        0.05,
-    )
-
-    orchestrator = ConversationOrchestrator(
-        settings,
-        "sk-test",
-        database,
-        lambda _event: None,
-        lambda _answer: None,
-    )
-    orchestrator._session_id = database.start_session()
-
-    await orchestrator._on_interviewer_event(
-        SpeechEvent(SpeechEventType.SOURCE_FINAL, "What is your biggest strength today?")
-    )
-    assert orchestrator._answer_task is not None
-    await orchestrator._answer_task
-
-    assert seen["question"] == "What is your biggest strength today?"
-    assert seen["translation"] == ""
+    assert orchestrator._last_turn_id == first_turn
