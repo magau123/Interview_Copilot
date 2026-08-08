@@ -7,6 +7,8 @@ each other and of the control console.
 
 from __future__ import annotations
 
+import sys
+
 from PySide6.QtCore import QEvent, QPoint, Qt, Signal
 from PySide6.QtWidgets import QAbstractScrollArea, QHBoxLayout, QSizeGrip, QVBoxLayout, QWidget
 
@@ -21,11 +23,17 @@ class OverlayWindow(QWidget):
     MIN_HEIGHT = 120
 
     def __init__(self, content: QWidget, *, tooltip: str = "") -> None:
-        super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool)
+        flags = (
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.WindowStaysOnTopHint
+        )
+        super().__init__(None, flags)
         self.setObjectName("overlayRoot")
         self.setMinimumSize(self.MIN_WIDTH, self.MIN_HEIGHT)
         self._drag_offset: QPoint | None = None
         self._content = content
+        self._keep_on_top = True
         if tooltip:
             self.setToolTip(tooltip)
 
@@ -49,6 +57,50 @@ class OverlayWindow(QWidget):
     def content(self) -> QWidget:
         return self._content
 
+    def set_keep_on_top(self, enabled: bool) -> None:
+        """Toggle always-on-top. Changing flags may hide the window briefly."""
+        enabled = bool(enabled)
+        has_hint = bool(self.windowFlags() & Qt.WindowType.WindowStaysOnTopHint)
+        if self._keep_on_top == enabled and has_hint == enabled:
+            if enabled and self.isVisible():
+                self.ensure_topmost()
+            return
+        was_visible = self.isVisible()
+        self._keep_on_top = enabled
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, enabled)
+        if was_visible:
+            self.show()
+            if enabled:
+                self.ensure_topmost()
+
+    def ensure_topmost(self) -> None:
+        """Re-assert topmost z-order so meeting apps cannot bury the panel."""
+        if not self._keep_on_top:
+            return
+        self.raise_()
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+
+            hwnd = int(self.winId())
+            hwnd_topmost = -1
+            swp_nomove = 0x0002
+            swp_nosize = 0x0001
+            swp_noactivate = 0x0010
+            swp_showwindow = 0x0040
+            ctypes.windll.user32.SetWindowPos(
+                hwnd,
+                hwnd_topmost,
+                0,
+                0,
+                0,
+                0,
+                swp_nomove | swp_nosize | swp_noactivate | swp_showwindow,
+            )
+        except Exception:
+            pass
+
     def set_alert(self, alert: bool) -> None:
         """Highlight the frame, e.g. while a newer answer waits to be shown."""
         if self.property("alert") == alert:
@@ -69,6 +121,10 @@ class OverlayWindow(QWidget):
             x, y, max(width, self.MIN_WIDTH), max(height, self.MIN_HEIGHT)
         )
         return True
+
+    def showEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        super().showEvent(event)
+        self.ensure_topmost()
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt naming
         kind = event.type()
@@ -116,3 +172,4 @@ class OverlayWindow(QWidget):
     def _end_drag(self) -> None:
         self._drag_offset = None
         self.moved.emit()
+        self.ensure_topmost()

@@ -151,8 +151,15 @@ class MainWindow(QMainWindow):
 
     def show(self) -> None:
         super().show()
+        self._apply_overlay_pinning()
         self.translation_overlay.show()
         self.answer_overlay.setVisible(self.answer_toggle.isChecked())
+        self._raise_overlays()
+
+    def _raise_overlays(self) -> None:
+        for overlay in (self.translation_overlay, self.answer_overlay):
+            if overlay.isVisible():
+                overlay.ensure_topmost()
 
     def _build_overlays(self) -> None:
         self.translation_view = QTextEdit()
@@ -227,7 +234,7 @@ class MainWindow(QMainWindow):
         self.follow_toggle.setToolTip("我一开口就滚动，停下就暂停（只用本地音量判断）")
         self.follow_toggle.toggled.connect(self._on_follow_toggled)
         self.pin_toggle = QCheckBox("置顶")
-        self.pin_toggle.setToolTip("让两个显示框浮在 Teams 上方；关闭后会被其他窗口盖住")
+        self.pin_toggle.setToolTip("保持两个显示框始终浮在 Teams 等窗口上方（默认开启）")
         self.pin_toggle.toggled.connect(self._on_pin_toggled)
         self.scope_combo = QComboBox()
         self.scope_combo.addItem("基于最近 1 句", 1)
@@ -353,15 +360,10 @@ class MainWindow(QMainWindow):
         )
 
     def _apply_overlay_pinning(self) -> None:
-        """Frameless panels have no taskbar entry, so pinning is also how they
-        come back after another window buries them."""
+        """Keep interview panels above Teams / browser meeting windows."""
         pinned = self.pin_toggle.isChecked()
         for overlay in (self.translation_overlay, self.answer_overlay):
-            was_visible = overlay.isVisible()
-            overlay.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, pinned)
-            # Changing flags hides the window; restore whatever it was doing.
-            if was_visible:
-                overlay.show()
+            overlay.set_keep_on_top(pinned)
 
     def _show_overlay_menu(self, position: QPoint) -> None:
         menu = QMenu(self)

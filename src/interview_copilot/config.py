@@ -35,7 +35,7 @@ class Settings:
     knowledge_app_id: str = "aid-433c2467738a4ae1948488f117508609"
     audio_device_index: int | None = None
     microphone_device_index: int | None = None
-    overlays_pinned: bool = False
+    overlays_pinned: bool = True
     # Floating panel placement as [x, y, width, height]; empty means "pick a default".
     translation_geometry: list[int] = field(default_factory=list)
     answer_geometry: list[int] = field(default_factory=list)
